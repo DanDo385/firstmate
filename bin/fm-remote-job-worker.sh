@@ -8,7 +8,8 @@
 # tracked non-symlink fm-*.sh under this worker's configured FM_ROOT/bin.
 #
 # Each child runs under env -i with the shared filesystem-composed PATH, HOME,
-# FM_HOME, FM_ROOT_OVERRIDE, and FM_REMOTE_JOB_ACTIVE=1. Commands receive their
+# FM_HOME, FM_ROOT_OVERRIDE, and FM_REMOTE_JOB_ACTIVE=1, plus TMPDIR/TMP/TEMP
+# under the home's config/tmp-root when that relocates temp files off /tmp. Commands receive their
 # captured stdin and have a 360-second default timeout. Their stdout and stderr
 # are independently constrained to the job library's 1048576-byte bound. A
 # record is marked done only after its bounded outputs and numeric exit status
@@ -76,6 +77,8 @@ FM_ROOT=${FM_ROOT_OVERRIDE:-$(CDPATH='' cd "$SCRIPT_DIR/.." && pwd -P)}
 
 # shellcheck source=bin/fm-remote-job-lib.sh
 . "$SCRIPT_DIR/fm-remote-job-lib.sh"
+# shellcheck source=bin/fm-path-lib.sh
+. "$SCRIPT_DIR/fm-path-lib.sh"
 
 WORKER_LOCK=
 WORKER_LOCK_HELD=0
@@ -934,6 +937,13 @@ worker_run_job() { # <account-home> <job-dir>
   )
   if [ -n "${FM_REMOTE_JOB_PLATFORM_OVERRIDE:-}" ]; then
     child_env+=("FM_REMOTE_JOB_PLATFORM_OVERRIDE=$FM_REMOTE_JOB_PLATFORM_OVERRIDE")
+  fi
+  # env -i drops TMPDIR, so a home whose config/tmp-root relocates temp files
+  # gives the job a private directory under that root instead of /tmp.
+  local job_tmp_root=
+  if [ -n "$home" ] && HOME=$account_home fm_tmp_root_to job_tmp_root "$home/config" 2>/dev/null &&
+    [ "$job_tmp_root" != /tmp ] && (umask 077 && mkdir -p "$job_tmp_root/remote-jobs") 2>/dev/null; then
+    child_env+=("TMPDIR=$job_tmp_root/remote-jobs" "TMP=$job_tmp_root/remote-jobs" "TEMP=$job_tmp_root/remote-jobs")
   fi
   remaining=$((deadline - $(date +%s)))
   [ "$remaining" -gt 0 ] || {
