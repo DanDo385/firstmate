@@ -44,6 +44,7 @@ fm_tmp_root_to() {  # <output-variable> <config-dir>
       break
     done < "$2/tmp-root"
   fi
+  # shellcheck disable=SC2088 # a literal ~/ prefix from the config file, expanded here
   case "$fm_root" in '~/'*) fm_root=$HOME/${fm_root#\~/} ;; esac
   [ -n "$fm_root" ] || fm_root=/tmp
   case "$fm_root" in

@@ -256,18 +256,18 @@ test_tmp_root_resolution() {
   . "$ROOT/bin/fm-path-lib.sh"
   local cfg="$TMP_ROOT/tmp-root-cfg" got
   mkdir -p "$cfg"
-  got=; FM_TMP_ROOT= fm_tmp_root_to got "$cfg" || fail "absent config/tmp-root was refused"
+  got=; FM_TMP_ROOT='' fm_tmp_root_to got "$cfg" || fail "absent config/tmp-root was refused"
   [ "$got" = /tmp ] || fail "absent config/tmp-root resolved to '$got', not /tmp"
   printf '# scratch root\n\n  ~/Code/.scratch/firstmate/tmp/  \n/ignored\n' > "$cfg/tmp-root"
-  got=; FM_TMP_ROOT= HOME=/home/someone fm_tmp_root_to got "$cfg" || fail "a ~/ config/tmp-root was refused"
+  got=; FM_TMP_ROOT='' HOME=/home/someone fm_tmp_root_to got "$cfg" || fail "a ~/ config/tmp-root was refused"
   [ "$got" = /home/someone/Code/.scratch/firstmate/tmp ] \
     || fail "config/tmp-root did not expand ~/ against HOME and trim its slash (got '$got')"
   got=; FM_TMP_ROOT=/var/fm-override fm_tmp_root_to got "$cfg" || fail "FM_TMP_ROOT was refused"
   [ "$got" = /var/fm-override ] || fail "FM_TMP_ROOT did not win over config/tmp-root (got '$got')"
   printf 'relative/dir\n' > "$cfg/tmp-root"
-  ! FM_TMP_ROOT= fm_tmp_root_to got "$cfg" || fail "a relative config/tmp-root was accepted"
+  ! FM_TMP_ROOT='' fm_tmp_root_to got "$cfg" || fail "a relative config/tmp-root was accepted"
   printf '/has space/dir\n' > "$cfg/tmp-root"
-  ! FM_TMP_ROOT= fm_tmp_root_to got "$cfg" || fail "a config/tmp-root with whitespace was accepted"
+  ! FM_TMP_ROOT='' fm_tmp_root_to got "$cfg" || fail "a config/tmp-root with whitespace was accepted"
   pass "fm_tmp_root_to resolves FM_TMP_ROOT, then config/tmp-root with ~/ expansion, then /tmp"
 }
 
