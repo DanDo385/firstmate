@@ -974,8 +974,8 @@ cmd_say() {
   need base64
 
   local src wav raw transcript
-  raw=$(mktemp /tmp/fm-inbox-audio-XXXXXX)
-  wav=$(mktemp /tmp/fm-inbox-wav-XXXXXX.wav)
+  raw=$(mktemp "${TMPDIR:-/tmp}/fm-inbox-audio-XXXXXX")
+  wav=$(mktemp "${TMPDIR:-/tmp}/fm-inbox-wav-XXXXXX.wav")
   # shellcheck disable=SC2064
   trap "rm -f '$raw' '$wav' '$wav.json'" EXIT
 
@@ -1080,7 +1080,7 @@ cmd_ask() {
   need aws
   need python3
   local q="$*" msg
-  msg=$(mktemp /tmp/fm-inbox-ask-XXXXXX.json)
+  msg=$(mktemp "${TMPDIR:-/tmp}/fm-inbox-ask-XXXXXX.json")
   # shellcheck disable=SC2064
   trap "rm -f '$msg'" EXIT
 

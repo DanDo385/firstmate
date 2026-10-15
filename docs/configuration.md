@@ -1043,6 +1043,21 @@ The text is static and never executed or expanded; secondmate charters never tak
 
 `bin/fm-brief.sh`'s header owns the placement rule and its safety argument.
 
+## Task temp root (config/tmp-root)
+
+The optional local, gitignored `config/tmp-root` names the directory that holds each task's private temp root (`fm-<id>/`, whose `gotmp/` is the worker's `GOTMPDIR`) and its staged launch directory (`fm-<id>+<home-token>/`).
+With no file the root is `/tmp`, exactly as before.
+`FM_TMP_ROOT` overrides the file for one process.
+
+The first non-blank line that does not start with `#` is used.
+It must be an absolute path with no whitespace; a leading `~/` expands against the executing host's `$HOME`, so one inherited value such as `~/Code/.scratch/firstmate/tmp` lands in each host's own home.
+An invalid value refuses the spawn.
+
+When the root is not `/tmp`, the spawn also creates `fm-<id>/tmp/` and exports it as `TMPDIR`, `TMP`, and `TEMP` into the worker's pane before launch, so `mktemp` and other tools that honor those variables stay under the root.
+Teardown removes the launch directory under the configured root and the legacy `/tmp` location.
+The file is inherited into secondmate homes through the [primary-authoritative configuration contract](../.agents/skills/secondmate-provisioning/SKILL.md).
+`bin/fm-path-lib.sh`'s `fm_tmp_root_to` owns the resolution.
+
 ## Worker launch environment (config/launch-env-allowlist)
 
 The optional local, gitignored `config/launch-env-allowlist` limits the ambient environment passed to newly launched workers, scouts, and secondmates, including relaunches.

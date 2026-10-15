@@ -3850,7 +3850,12 @@ teardown_launch_home_token() {
 }
 LAUNCH_HOME_TOKEN=$(teardown_launch_home_token "$FM_HOME") || LAUNCH_HOME_TOKEN=
 if [ -n "$LAUNCH_HOME_TOKEN" ]; then
-  rm -rf "/tmp/fm-$ID+$LAUNCH_HOME_TOKEN"
+  # The launch directory sits under the configured temp root (bin/fm-path-lib.sh's
+  # fm_tmp_root_to); /tmp is also cleared so a task launched before a root change
+  # leaves nothing behind.
+  fm_tmp_root_to TEARDOWN_TMP_ROOT "$CONFIG" || TEARDOWN_TMP_ROOT=/tmp
+  rm -rf "$TEARDOWN_TMP_ROOT/fm-$ID+$LAUNCH_HOME_TOKEN"
+  [ "$TEARDOWN_TMP_ROOT" = /tmp ] || rm -rf "/tmp/fm-$ID+$LAUNCH_HOME_TOKEN"
 fi
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1

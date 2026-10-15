@@ -68,6 +68,8 @@ SH
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # fm-lease-lib.sh: teardown sources it for the supervision lease guard.
   ln -s "$ROOT/bin/fm-lease-lib.sh" "$fake/bin/fm-lease-lib.sh"
+  # fm-supervision-engine-lib.sh: fm-lease-lib.sh sources it.
+  ln -s "$ROOT/bin/fm-supervision-engine-lib.sh" "$fake/bin/fm-supervision-engine-lib.sh"
   # Lifecycle serialization, status presentation retirement, and shared adapter
   # ownership are sourced by teardown.
   ln -s "$ROOT/bin/fm-control-lib.sh" "$fake/bin/fm-control-lib.sh"
@@ -175,6 +177,8 @@ SH
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # fm-lease-lib.sh: teardown sources it for the supervision lease guard.
   ln -s "$ROOT/bin/fm-lease-lib.sh" "$fake/bin/fm-lease-lib.sh"
+  # fm-supervision-engine-lib.sh: fm-lease-lib.sh sources it.
+  ln -s "$ROOT/bin/fm-supervision-engine-lib.sh" "$fake/bin/fm-supervision-engine-lib.sh"
   ln -s "$ROOT/bin/fm-control-lib.sh" "$fake/bin/fm-control-lib.sh"
   ln -s "$ROOT/bin/fm-classify-lib.sh" "$fake/bin/fm-classify-lib.sh"
   # fm-timeout-lib.sh: the shared hard bound fm-classify-lib.sh sources for the
@@ -247,6 +251,46 @@ test_teardown_skips_gracefully_when_dir_missing() {
   pass "fm-teardown skips gracefully when tasktmp= points to a nonexistent dir"
 }
 
+test_tmp_root_resolution() {
+  # shellcheck source=bin/fm-path-lib.sh
+  . "$ROOT/bin/fm-path-lib.sh"
+  local cfg="$TMP_ROOT/tmp-root-cfg" got
+  mkdir -p "$cfg"
+  got=; FM_TMP_ROOT= fm_tmp_root_to got "$cfg" || fail "absent config/tmp-root was refused"
+  [ "$got" = /tmp ] || fail "absent config/tmp-root resolved to '$got', not /tmp"
+  printf '# scratch root\n\n  ~/Code/.scratch/firstmate/tmp/  \n/ignored\n' > "$cfg/tmp-root"
+  got=; FM_TMP_ROOT= HOME=/home/someone fm_tmp_root_to got "$cfg" || fail "a ~/ config/tmp-root was refused"
+  [ "$got" = /home/someone/Code/.scratch/firstmate/tmp ] \
+    || fail "config/tmp-root did not expand ~/ against HOME and trim its slash (got '$got')"
+  got=; FM_TMP_ROOT=/var/fm-override fm_tmp_root_to got "$cfg" || fail "FM_TMP_ROOT was refused"
+  [ "$got" = /var/fm-override ] || fail "FM_TMP_ROOT did not win over config/tmp-root (got '$got')"
+  printf 'relative/dir\n' > "$cfg/tmp-root"
+  ! FM_TMP_ROOT= fm_tmp_root_to got "$cfg" || fail "a relative config/tmp-root was accepted"
+  printf '/has space/dir\n' > "$cfg/tmp-root"
+  ! FM_TMP_ROOT= fm_tmp_root_to got "$cfg" || fail "a config/tmp-root with whitespace was accepted"
+  pass "fm_tmp_root_to resolves FM_TMP_ROOT, then config/tmp-root with ~/ expansion, then /tmp"
+}
+
+test_teardown_removes_launch_dir_under_tmp_root() {
+  local id=td-launch-z5
+  local fake root token launch
+  fake=$(make_fake_root "$id" "$TMP_ROOT/fm-$id-tasktmp")
+  root="$TMP_ROOT/scratch-root"
+  mkdir -p "$fake/config" "$root"
+  printf '%s\n' "$root" > "$fake/config/tmp-root"
+  token=$(cd "$fake" && pwd -P | tr -d '\n' | shasum -a 256 2>/dev/null | awk '{print $1}')
+  [ -n "$token" ] || token=$(cd "$fake" && pwd -P | tr -d '\n' | sha256sum | awk '{print $1}')
+  launch="$root/fm-$id+$token"
+  mkdir -p "$launch"
+  printf 'launch\n' > "$launch/launch.s1.sh"
+  FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" >/dev/null 2>&1 \
+    || fail "teardown exited non-zero with a configured tmp-root"
+  [ ! -e "$launch" ] || fail "teardown left the launch directory under config/tmp-root ($launch)"
+  pass "fm-teardown removes the launch directory under config/tmp-root"
+}
+
 test_teardown_removes_tasktmp_dir
 test_teardown_skips_gracefully_without_tasktmp
 test_teardown_skips_gracefully_when_dir_missing
+test_tmp_root_resolution
+test_teardown_removes_launch_dir_under_tmp_root

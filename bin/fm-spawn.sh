@@ -712,6 +712,12 @@ fi
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# Root for per-task temp and launch directories (bin/fm-path-lib.sh's
+# fm_tmp_root_to owns the resolution); resolved once so every path agrees.
+if ! fm_tmp_root_to SPAWN_TMP_ROOT "$CONFIG"; then
+  echo "error: config/tmp-root or FM_TMP_ROOT must name an absolute path with no whitespace; refusing to spawn" >&2
+  exit 1
+fi
 # shellcheck source=bin/fm-classify-lib.sh
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 fm_backlog_directory_present "$STATE" "state directory" || {
@@ -4800,7 +4806,13 @@ esac
 # this user and writable by nobody else, then tightened, so no other local user
 # can plant or swap a file in it. The staged launch command lives in a sibling
 # directory namespaced by home identity, not in this shared per-id root.
-TASK_TMP="/tmp/fm-$ID"
+# config/tmp-root (or FM_TMP_ROOT) relocates this root and the launch directory
+# off /tmp; SPAWN_TMP_ROOT is resolved once after fm-path-lib.sh loads.
+if [ "$SPAWN_TMP_ROOT" != /tmp ] && ! (umask 077 && mkdir -p "$SPAWN_TMP_ROOT"); then
+  echo "error: cannot create the task temp root $SPAWN_TMP_ROOT from config/tmp-root" >&2
+  exit 1
+fi
+TASK_TMP="$SPAWN_TMP_ROOT/fm-$ID"
 if ! (umask 077 && mkdir "$TASK_TMP") 2>/dev/null; then
   if [ -L "$TASK_TMP" ] || [ ! -d "$TASK_TMP" ] || [ ! -O "$TASK_TMP" ] ||
     [ -n "$(find "$TASK_TMP" -prune \( -perm -g=w -o -perm -o=w \) -print 2>/dev/null)" ] ||
@@ -4810,6 +4822,10 @@ if ! (umask 077 && mkdir "$TASK_TMP") 2>/dev/null; then
   fi
 fi
 mkdir -p "$TASK_TMP/gotmp"
+# A relocated root also carries the worker's general temp directory, exported as
+# TMPDIR/TMP/TEMP before launch, so mktemp and every tool that honors those land
+# under the configured root instead of the host default.
+[ "$SPAWN_TMP_ROOT" = /tmp ] || mkdir -p "$TASK_TMP/tmp"
 
 # Per-harness turn-end hook where enabled: a file that touches
 # state/<id>.turn-ended when the agent finishes a turn. Worktree-resident hooks
@@ -5734,7 +5750,7 @@ fi
 case "$SPAWN_GEN" in
   *[!A-Za-z0-9.]*|'') echo "error: spawn incarnation token is not a usable launch-file nonce" >&2; exit 1 ;;
 esac
-LAUNCH_DIR="/tmp/fm-$ID+$LAUNCH_HOME_TOKEN"
+LAUNCH_DIR="$SPAWN_TMP_ROOT/fm-$ID+$LAUNCH_HOME_TOKEN"
 # Pane-scoped override: git in this worker reads our commit-msg strip without
 # rewriting the project's core.hooksPath. GIT_CONFIG_* takes precedence over
 # config files and is inherited by child git processes. When the home opts in
@@ -5818,6 +5834,8 @@ spawn_record_traceparent() {
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
+[ "$SPAWN_TMP_ROOT" = /tmp ] ||
+  spawn_send_text_line "$T" "export TMPDIR=$TASK_TMP/tmp TMP=$TASK_TMP/tmp TEMP=$TASK_TMP/tmp"
 # Export the compact-adviser kill switch into the pane shell through the same
 # pre-launch channel, so later commands in that shell inherit it too. The launch
 # command independently establishes the value for the agent process itself.
@@ -5895,6 +5913,10 @@ if [ "$LAUNCH_ENV_ENABLED" = 1 ]; then
   fi
   LAUNCH="$LAUNCH_ENV_PREFIX /bin/sh -c $(shell_quote "$LAUNCH")"
 fi
+[ "$SPAWN_TMP_ROOT" = /tmp ] || (umask 077 && mkdir -p "$SPAWN_TMP_ROOT") || {
+  echo "error: cannot create the task temp root $SPAWN_TMP_ROOT from config/tmp-root" >&2
+  exit 1
+}
 if ! (umask 077 && mkdir "$LAUNCH_DIR") 2>/dev/null; then
   if [ -L "$LAUNCH_DIR" ] || [ ! -d "$LAUNCH_DIR" ] || [ ! -O "$LAUNCH_DIR" ] ||
     [ -n "$(find "$LAUNCH_DIR" -prune \( -perm -g=w -o -perm -o=w \) -print 2>/dev/null)" ] ||
