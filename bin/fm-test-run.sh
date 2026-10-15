@@ -2241,8 +2241,8 @@ if [ "${#SCRIPTS[@]}" -eq 0 ]; then
     fi
   fi
   if [ -n "$JSON_PATH" ]; then
-    empty_rec=$(mktemp)
-    empty_fam=$(mktemp)
+    empty_rec=$(mktemp "${TMPDIR:-/tmp}/fm-test-run-rec.XXXXXX")
+    empty_fam=$(mktemp "${TMPDIR:-/tmp}/fm-test-run-fam.XXXXXX")
     : >"$empty_rec"
     : >"$empty_fam"
     empty_finished_iso=$(now_iso)

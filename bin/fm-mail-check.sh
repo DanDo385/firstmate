@@ -196,7 +196,7 @@ poll_has_publication_evidence() {
 action_check() {
   local out rc line woken_before queued=0
   mkdir -p "$STATE" || return 1
-  woken_before=$(mktemp) || woken_before=
+  woken_before=$(mktemp "${TMPDIR:-/tmp}/fm-mail-woken.XXXXXX") || woken_before=
   if [ -n "$woken_before" ]; then
     if [ -f "$STATE/.mail-woken" ]; then
       cp "$STATE/.mail-woken" "$woken_before" 2>/dev/null || : > "$woken_before"

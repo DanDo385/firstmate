@@ -135,7 +135,7 @@ fi
 [ -e "$RULES_PATH" ] || [ -L "$RULES_PATH" ] || no_rules
 [ -r "$RULES_PATH" ] || die "rules file not readable: $RULES_PATH"
 command -v jq >/dev/null 2>&1 || die "jq required"
-RULES=$(mktemp) || die "mktemp failed"
+RULES=$(mktemp "${TMPDIR:-/tmp}/fm-dispatch-rules.XXXXXX") || die "mktemp failed"
 trap 'rm -f "$RULES"' EXIT
 cp "$RULES_PATH" "$RULES" || die "could not snapshot rules file: $RULES_PATH"
 chmod 400 "$RULES" || die "could not protect rules snapshot"
@@ -241,10 +241,10 @@ if [ "$RULE_COUNT" -eq 0 ]; then
   no_rules
 fi
 
-RESP_FILE=$(mktemp) || die "mktemp failed"
-QUOTA=$(mktemp) || { rm -f "$RESP_FILE"; die "mktemp failed"; }
-TASK_TEXT=$(mktemp) || { rm -f "$RESP_FILE" "$QUOTA"; die "mktemp failed"; }
-SEND_TEXT=$(mktemp) || { rm -f "$RESP_FILE" "$QUOTA" "$TASK_TEXT"; die "mktemp failed"; }
+RESP_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-dispatch-resp.XXXXXX") || die "mktemp failed"
+QUOTA=$(mktemp "${TMPDIR:-/tmp}/fm-dispatch-quota.XXXXXX") || { rm -f "$RESP_FILE"; die "mktemp failed"; }
+TASK_TEXT=$(mktemp "${TMPDIR:-/tmp}/fm-dispatch-task.XXXXXX") || { rm -f "$RESP_FILE" "$QUOTA"; die "mktemp failed"; }
+SEND_TEXT=$(mktemp "${TMPDIR:-/tmp}/fm-dispatch-send.XXXXXX") || { rm -f "$RESP_FILE" "$QUOTA" "$TASK_TEXT"; die "mktemp failed"; }
 trap 'rm -f "$RULES" "$RESP_FILE" "$QUOTA" "$TASK_TEXT" "$SEND_TEXT"' EXIT
 
 never_send_off() {
