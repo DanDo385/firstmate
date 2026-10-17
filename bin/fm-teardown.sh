@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tear down a finished task: return the treehouse worktree, release the Orca
+# Tear down a finished task: remove the wt-managed worktree (or return a legacy treehouse pool slot), release the Orca
 # worktree, or retire a secondmate home; kill the recorded runtime endpoint,
 # clear volatile state, and transition this home's backlog item for ship and
 # scout tasks before reporting success (a secondmate teardown transitions none,
@@ -2028,6 +2028,57 @@ validate_worktree_teardown_safety() {
   fi
 }
 
+# Remove a wt-managed worktree (any task checkout that is not a Treehouse
+# pool slot) after the caller landed-work gates pass. Runs the caller safety
+# check first, then removes with plain `git worktree remove` (no --force) so
+# git re-verifies cleanliness; --force discards only under an explicit
+# --force teardown or a scout scrub, where discarding is already authorized.
+teardown_wt_worktree_remove() { # <post-lock-check|empty>
+  local check=${1:-} wt_real proj_real home_real
+  [ -d "$WT" ] || return 0
+  if [ -n "$check" ]; then
+    "$check" || return 1
+  fi
+  wt_real=$(cd "$WT" 2>/dev/null && pwd -P) || {
+    echo "error: cannot resolve worktree $WT for removal; teardown aborted" >&2; return 1; }
+  proj_real=$(cd "$PROJ" 2>/dev/null && pwd -P) || proj_real=$PROJ
+  home_real=$(cd "$HOME" 2>/dev/null && pwd -P) || home_real=$HOME
+  case "$wt_real" in "$home_real"/Code/worktrees/*) ;;
+    *) echo "error: refusing to remove worktree outside ~/Code/worktrees: $wt_real" >&2; return 1 ;; esac
+  if [ "$wt_real" = "$proj_real" ]; then
+    echo "error: refusing to remove the project checkout itself: $wt_real" >&2; return 1
+  fi
+  if [ "$FORCE" = "--force" ] || [ "$KIND" = scout ]; then
+    git -C "$PROJ" worktree remove --force "$WT" || {
+      echo "error: could not remove worktree $WT; teardown aborted" >&2; return 1; }
+  else
+    git -C "$PROJ" worktree remove "$WT" || {
+      echo "error: could not remove worktree $WT (it may have become dirty since the safety check); teardown aborted" >&2; return 1; }
+  fi
+  git -C "$PROJ" worktree prune >/dev/null 2>&1 || true
+}
+
+# Managed scratch run close-out (best-effort, never blocks teardown). A task
+# whose temp root is a run tmp/ gets its run marked now that every gate
+# passed: successful on a clean teardown, failed when --force discarded
+# unlanded work. Any earlier failure leaves the run active, which scratch-gc
+# always preserves for investigation.
+teardown_mark_run_status() {
+  local run_dir run_id run_project resolver want
+  [ "${KIND:-}" != secondmate ] || return 0
+  [ -n "${TASK_TMP:-}" ] || return 0
+  case "$TASK_TMP" in */tmp) run_dir=${TASK_TMP%/tmp} ;; *) return 0 ;; esac
+  [ -f "$run_dir/run.json" ] && [ ! -L "$run_dir" ] || return 0
+  run_id=$(sed -n 's/.*"run_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$run_dir/run.json" | head -n 1)
+  run_project=$(sed -n 's/.*"project"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$run_dir/run.json" | head -n 1)
+  [ -n "$run_id" ] && [ -n "$run_project" ] || return 0
+  if command -v scratch-run >/dev/null 2>&1; then resolver=scratch-run;
+  elif [ -x "$HOME/dotfiles/bin/scratch-run" ]; then resolver="$HOME/dotfiles/bin/scratch-run";
+  else return 0; fi
+  want=successful; [ "${FORCE:-}" = "--force" ] && want=failed
+  "$resolver" set-status --project "$run_project" --run-id "$run_id" --status "$want" \
+    --note "firstmate task $ID teardown complete" >/dev/null 2>&1 || true
+}
 # Fix 1 (see script header): does the active-or-most-recent no-mistakes run in
 # worktree $1 belong to THIS task, and is it parked at a gate awaiting an agent
 # that is about to be removed? Prints nothing; returns 0 only on a genuine
@@ -3680,10 +3731,13 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
   rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" \
     "$WT/.fm-grok-turnend" "$WT/.fm-kimi-turnend"
-  # Kills remaining processes in the worktree (including the agent), resets, returns
-  # to pool. treehouse resolves the pool from the working directory, so run it from
-  # the project. teardown_treehouse_return tolerates transient and stale git locks
-  # left by a killed crew process; see the script header for retry and stale-lock proof.
+  # Process cleanup above already reaped the worktree processes. Pool slots
+  # allocated before the wt switch return through the legacy treehouse path;
+  # wt-managed worktrees are removed with `git worktree remove` after the
+  # same landed-work gates. treehouse resolves the pool from the working
+  # directory, so the legacy return runs from the project.
+  # teardown_treehouse_return tolerates transient and stale git locks left
+  # by a killed crew process; see the script header for retry and stale-lock proof.
   post_lock_cleanup_check=
   if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
     post_lock_cleanup_check=validate_worktree_teardown_safety
@@ -3691,18 +3745,20 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   if [ "$KIND" = scout ] || [ "$FORCE" = "--force" ]; then
     teardown_scrub_scratch_copy "$WT" || exit 1
   fi
-  wt_pool_slot=0
-  fm_treehouse_pool_slot "$PROJ" "$WT" && wt_pool_slot=1
-  teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" || {
-    echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
-    exit 1
-  }
-  [ "$wt_pool_slot" = 0 ] || teardown_note_dirty_return "$WT"
-  # The slot is back in the pool, so this task's claim on it is spent. Dropping
-  # it here - and only after a return that succeeded - keeps a returned slot
-  # unclaimed until its next holder claims it, and leaves the claim in place
-  # whenever the return did not actually happen.
-  fm_treehouse_slot_owner_release "$WT" "$ID"
+  if fm_treehouse_pool_slot "$PROJ" "$WT"; then
+    teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" || {
+      echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+      exit 1
+    }
+    teardown_note_dirty_return "$WT"
+    # The slot is back in the pool, so this task's claim on it is spent. Dropping
+    # it here - and only after a return that succeeded - keeps a returned slot
+    # unclaimed until its next holder claims it, and leaves the claim in place
+    # whenever the return did not actually happen.
+    fm_treehouse_slot_owner_release "$WT" "$ID"
+  else
+    teardown_wt_worktree_remove "$post_lock_cleanup_check" || exit 1
+  fi
 fi
 
 HERDR_PRESENTATION_JOURNAL="$STATE/$ID.herdr-presentation"
@@ -3828,7 +3884,7 @@ fi
 remove_grok_turnend_auth "$STATE" "$ID" || exit 1
 remove_kimi_turnend_auth "$STATE" "$ID" || exit 1
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
-# Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
+# Remove the per-task temp root (the managed run tmp/ for new tasks, /tmp/fm-<id>/ for legacy ones) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
 # Retire only this Firstmate home's launch namespace. Its never-reused per-spawn
@@ -3935,6 +3991,11 @@ fi
 if [ -d "$STATE" ]; then
   "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
 fi
+# Managed scratch run close-out: every gate above passed, so mark the run.
+# Best-effort and silent; any earlier failure leaves the run for scratch-gc
+# to preserve and a later investigation to close.
+teardown_mark_run_status
+
 if [ "$TEARDOWN_POOL_SLOT_LOST" = 1 ]; then
   echo "teardown $ID finished its cleanup and removed its task record, but a returned pool slot did not come back clean (see the warning above); clear those paths so the pool can reuse the slot" >&2
 elif [ "$TEARDOWN_LEGACY_ACCEPTED" = 1 ]; then

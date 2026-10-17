@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
+# Spawn a direct report: a crewmate in a wt-managed git worktree or an Orca worktree, or a
 # secondmate in its isolated firstmate home.
 # Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
 #        fm-spawn.sh <task-id> <project-dir> --scout [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
@@ -107,8 +107,8 @@
 #   then tmux.
 #   Spawn-capable backends are the reference tmux adapter, verified herdr
 #   adapter, and experimental zellij, orca, and cmux adapters. Orca owns both
-#   the task worktree and terminal, so ship/scout Orca spawns do not run
-#   treehouse get; cmux is a session provider only, exactly like herdr/zellij,
+#   the task worktree and terminal, so ship/scout Orca spawns do not allocate
+#   a wt worktree; cmux is a session provider only, exactly like herdr/zellij,
 #   so it does. Auto-detected herdr stays silent like tmux; auto-detected cmux
 #   prints a loud stderr notice; zellij and orca are never auto-detected.
 #   codex-app is not a known backend yet; docs/codex-app-backend.md owns that
@@ -280,7 +280,7 @@
 #   primary checkout, including when the spawning project is a linked worktree.
 #   On the backends that discover that path by reading the task pane's own cwd,
 #   the same isolation test screens every read: a pane still showing the project
-#   or the repository primary while `treehouse get` prepares the slot is waited
+#   or the repository primary while the wt worktree is allocated is waited
 #   out as a transient rather than adopted and then refused, so a home that is
 #   itself a linked worktree of the project repository still launches. A pane
 #   that never reaches an isolated worktree refuses at the end of that wait,
@@ -4620,6 +4620,128 @@ agy_spawn_fail() {  # <detail>
   rovo_endpoint_cleanup
 }
 
+# Managed worktree allocation (wt semantics): every fresh ship/scout checkout is
+# a plain git worktree under ${WT_BASE:-$HOME/Code/worktrees}/{repo}/{slug} on
+# the task branch. The Treehouse pool is retired for new tasks; teardown keeps
+# the legacy `treehouse return` path only for slots allocated before this
+# switch (detected via fm_treehouse_pool_slot). WT_BASE must resolve inside
+# $HOME/Code/worktrees; refuse otherwise rather than scattering checkouts.
+spawn_wt_repo_name() { # <project-dir> -> stdout repo name
+  local remote url repo
+  remote=$(git -C "$1" remote get-url origin 2>/dev/null || true)
+  if [ -n "$remote" ]; then
+    url=${remote%.git}
+    url=${url#git@github.com:}
+    url=${url#https://github.com/}
+    url=${url#ssh://git@github.com/}
+    repo=$(basename "$url")
+    if [ -n "$repo" ] && [ "$repo" != / ] && [ "$repo" != . ]; then
+      printf '%s' "$repo"
+      return 0
+    fi
+  fi
+  basename "$1"
+}
+
+spawn_wt_default_base() { # <project-dir> -> stdout base ref
+  local ref
+  ref=$(git -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  if [ -n "$ref" ]; then printf '%s' "$ref"; return 0; fi
+  for ref in origin/main origin/master; do
+    if git -C "$1" show-ref --verify --quiet "refs/remotes/$ref"; then printf '%s' "$ref"; return 0; fi
+  done
+  printf 'HEAD'
+}
+
+SPAWN_WT_CREATED=0
+spawn_allocate_wt_worktree() { # sets WT; returns nonzero on refusal
+  local repo wt_base_real home_real wt_path base has_origin
+  WT_BASE=${WT_BASE:-$HOME/Code/worktrees}
+  home_real=$(cd "$HOME" 2>/dev/null && pwd -P) || {
+    echo "error: cannot resolve home for worktree allocation" >&2; return 1; }
+  case "$WT_BASE" in
+    "$HOME"/Code/worktrees|"$HOME"/Code/worktrees/*|"$home_real"/Code/worktrees|"$home_real"/Code/worktrees/*) ;;
+    *) echo "error: WT_BASE '$WT_BASE' is outside the managed ~/Code/worktrees tree; refusing to scatter task checkouts" >&2; return 1 ;;
+  esac
+  repo=$(spawn_wt_repo_name "$PROJ_ABS") || {
+    echo "error: cannot derive a repository name for $PROJ_ABS" >&2; return 1; }
+  case "$repo" in ''|.*|*/*) echo "error: refusing unsafe repository name '$repo'" >&2; return 1 ;; esac
+  case "$ID" in ''|.*|*/*) echo "error: refusing unsafe task slug '$ID'" >&2; return 1 ;; esac
+  mkdir -p "$WT_BASE/$repo" 2>/dev/null || {
+    echo "error: cannot create worktree parent $WT_BASE/$repo" >&2; return 1; }
+  wt_base_real=$(cd "$WT_BASE" 2>/dev/null && pwd -P) || {
+    echo "error: cannot resolve WT_BASE $WT_BASE" >&2; return 1; }
+  case "$wt_base_real" in "$home_real"/Code/worktrees|"$home_real"/Code/worktrees/*) ;;
+    *) echo "error: WT_BASE resolves outside ~/Code/worktrees ($wt_base_real); refusing" >&2; return 1 ;; esac
+  wt_path="$wt_base_real/$repo/$ID"
+  if [ -e "$wt_path" ] || [ -L "$wt_path" ]; then
+    echo "error: worktree path $wt_path already exists for task $ID; remove it (wt rm semantics: refuse when dirty or unpushed) and retry" >&2
+    return 1
+  fi
+  if spawn_worktree_has_origin_config "$PROJ_ABS"; then
+    has_origin=1
+    git -C "$PROJ_ABS" fetch --quiet origin 2>/dev/null || true
+  else
+    has_origin=0
+  fi
+  if [ -n "$BASE_BRANCH" ]; then
+    if [ "$has_origin" = 0 ]; then
+      echo "error: task $ID selects base branch '$BASE_BRANCH' but $PROJ_ABS has no origin" >&2
+      return 1
+    fi
+    base="origin/$BASE_BRANCH"
+    git -C "$PROJ_ABS" rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1 || {
+      echo "error: base '$base' is not a commit in $PROJ_ABS" >&2; return 1; }
+  elif [ "$has_origin" = 1 ]; then
+    base=$(spawn_wt_default_base "$PROJ_ABS")
+  else
+    base=HEAD
+  fi
+  if [ "$KIND" = scout ] || [ -z "${BRANCH:-}" ]; then
+    # Scouts hold no branch: a detached checkout keeps the no-branch contract.
+    git -C "$PROJ_ABS" worktree add --detach "$wt_path" "$base" >/dev/null || {
+      echo "error: could not create detached scout worktree $wt_path from $base" >&2; return 1; }
+  elif git -C "$PROJ_ABS" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    git -C "$PROJ_ABS" worktree add "$wt_path" "$BRANCH" >/dev/null || {
+      echo "error: could not check out existing branch $BRANCH at $wt_path" >&2; return 1; }
+  else
+    git -C "$PROJ_ABS" worktree add --no-track -b "$BRANCH" "$wt_path" "$base" >/dev/null || {
+      echo "error: could not create worktree $wt_path on branch $BRANCH from $base" >&2; return 1; }
+  fi
+  WT="$wt_path"
+  SPAWN_WT_CREATED=1
+}
+
+# Managed scratch run for this task (bin/scratch-run in dotfiles is the one
+# resolver; this script carries no divergent copy). Ship/scout temp lives at
+# <run>/tmp, so teardown's rm -rf "$TASK_TMP" removes only temp while run.json,
+# logs, and artifacts survive for scratch-gc. Sets SCRATCH_RUN_DIR and TASK_TMP.
+spawn_managed_run() { # init (idempotent) or refresh the task run; sets SCRATCH_RUN_DIR/TASK_TMP
+  local resolver run_project
+  resolver=""
+  if command -v scratch-run >/dev/null 2>&1; then
+    resolver=scratch-run
+  elif [ -x "$HOME/dotfiles/bin/scratch-run" ]; then
+    resolver="$HOME/dotfiles/bin/scratch-run"
+  else
+    echo "error: scratch-run resolver not found (set PATH or link $HOME/dotfiles/bin); refusing to spawn without a managed run directory" >&2
+    return 1
+  fi
+  run_project=$(basename "$PROJ_ABS")
+  case "$run_project" in ''|.*|*/*|*[!A-Za-z0-9._-]* )
+    echo "error: refusing unsafe run project name '$run_project'" >&2; return 1 ;; esac
+  # init is idempotent: an existing run keeps created_at and is marked active,
+  # which is exactly the relaunch semantic.
+  SCRATCH_RUN_DIR=$("$resolver" init \
+    --project "$run_project" --run-id "$ID" \
+    --harness "$HARNESS" --owner "fm-$ID" \
+    --note "firstmate $KIND task $ID branch ${BRANCH:-none}") || {
+    echo "error: cannot create a managed scratch run for task $ID" >&2; return 1; }
+  TASK_TMP="$SCRATCH_RUN_DIR/tmp"
+  (umask 077 && mkdir -p "$TASK_TMP/gotmp") || {
+    echo "error: cannot create gotmp under $TASK_TMP" >&2; return 1; }
+}
+
 if [ "$RELAUNCH" -eq 1 ] && [ "$BACKEND" = orca ]; then
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
 elif [ "$RELAUNCH" -eq 1 ]; then
@@ -4656,92 +4778,19 @@ elif [ "$RELAUNCH" -eq 1 ]; then
   fi
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
 elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
-  spawn_send_text_line "$WT_TARGET" 'treehouse get'
-
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
-  # Target the stable window id, not the name: if the name is ever lost (e.g. an
-  # automatic-rename slips through), display-message -t <bad-name> falls back to the
-  # active client's window, which would misread firstmate's OWN pane path as the
-  # worktree and tangle a hook into the primary checkout. The window id never lies.
-  # The project comparison is physical: spawn_worktree_isolated screens each
-  # read against PROJ_ABS_REAL, not PROJ_ABS, because a symlinked project prefix
-  # would otherwise make the pane's OS-level cwd read differ from PROJ_ABS on
-  # the very first poll, before the pane has actually moved.
-  #
-  # A single read that already looks isolated is not proof the pane settled
-  # there: on some tmux/WSL setups a brand-new window's pane_current_path
-  # transiently reports an unrelated stale path (seen live as another real git
-  # checkout entirely) before the shell catches up with treehouse get's cd. That
-  # stale path passes spawn_worktree_isolated too (it resolves to a real,
-  # distinct worktree top-level), so accepting it on one read alone silently
-  # records the wrong worktree= in state/<id>.meta. Require two consecutive
-  # reads to agree on the same isolated path before accepting it; a mismatch
-  # just becomes the new candidate rather than resetting the wait, so a pane
-  # that is already settled by the first real read only costs the one existing
-  # inter-poll sleep as confirmation, not a whole extra cycle on top.
-  #
-  # Every candidate is screened with the isolation guard's own predicate, so a
-  # read of the project itself or of the repository primary checkout is treated
-  # as the transient it is and the wait continues, instead of being adopted and
-  # then refused by the guard.
-  # A candidate the screen rejects is never adopted, so a host where the pane
-  # never reaches an isolated worktree spends the whole window before refusing.
-  # That wait is deliberate - telling a transient apart from a terminal
-  # misconfiguration would need machinery this path does not want - so the
-  # refusal has to be self-explaining instead: carry the last path seen and the
-  # reason it was rejected, and report both at the deadline.
-  candidate=""
-  last_seen=""
-  last_reason="the pane reported no path"
-  for _ in $(seq 1 60); do
-    p=$(spawn_current_path "$WT_TARGET" || true)
-    [ -z "$p" ] || last_seen="$p"
-    if [ -n "$p" ] && spawn_worktree_isolated "$p"; then
-      p_real=$(real_path_or_raw "$p")
-      last_reason="it is an isolated worktree, but no second read agreed with it"
-      if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
-        WT="$p"
-        break
-      fi
-      candidate="$p_real"
-    else
-      candidate=""
-      [ -z "$p" ] || last_reason=$SPAWN_WT_REASON
-    fi
-    sleep 1
-  done
-  if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter an isolated worktree within 60s (last seen '${last_seen:-none}': $last_reason; spawning project '$PROJ_ABS'); inspect window $T" >&2
-    exit 1
-  fi
-
-  validate_spawn_worktree "treehouse get" "$T"
-
-  # Claim the pool slot for this task. The interactive `treehouse get` sent to
-  # the pane above records only a process lease (Treehouse's durable
-  # `get --lease --lease-holder`, which bin/fm-home-seed.sh uses for secondmate
-  # homes, is not this path), so Treehouse cannot say which task a slot belongs
-  # to once that task's worker exits - and that is exactly when the slot is
-  # handed on and this task's worktree= line goes stale. The claim is what lets
-  # bin/fm-teardown.sh leave a slot that has since been reassigned untouched, so
-  # a slot that cannot be claimed is refused here, at the cheapest point, rather
-  # than launching a worker whose slot teardown could later release out from
-  # under its successor.
-  # Written under the Treehouse project lock held from before slot allocation
-  # through metadata publication, so no other spawn or return sees a half-claim.
-  if fm_treehouse_pool_slot "$PROJ_ABS" "$WT"; then
-    if ! fm_treehouse_slot_owner_claim "$WT" "$ID" "$FM_HOME"; then
-      echo "error: could not claim Treehouse pool slot $WT for task $ID; refusing to launch a worker whose slot cannot later be proved to be its own; inspect window $T" >&2
-      exit 1
-    fi
-    SPAWN_SLOT_CLAIMED=1
-  fi
+  # Managed worktree allocation (wt semantics): the checkout is created
+  # synchronously here under ~/Code/worktrees/{repo}/{slug}, so the pane
+  # never needs an interactive pool lease. Teardown removes it with
+  # `git worktree remove` after the landed-work gates pass.
+  spawn_allocate_wt_worktree || exit 1
+  validate_spawn_worktree "wt worktree add" "$T"
+  SPAWN_SLOT_CLAIMED=0
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   freshen_spawn_worktree_base "$WT" "$BASE_BRANCH" || exit 1
 fi
 
-# Re-assert the durable task copy after either treehouse acquisition or endpoint
+# Re-assert the durable task copy after either worktree allocation or endpoint
 # adoption. This also updates Herdr's restored pane shell before any harness is
 # started, so a later host restart inherits the task worktree rather than the
 # tab's original project directory.
@@ -4796,36 +4845,30 @@ agy)
   ;;
 esac
 
-# Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
-# create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
-# Nested (not a bare /tmp/fm-<id>/gotmp) so other per-task temp can live alongside
-# later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
-# targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
-# The root is private (0700) because its path is predictable under a shared
-# /tmp: a root that already exists is reused only as a real directory owned by
-# this user and writable by nobody else, then tightened, so no other local user
-# can plant or swap a file in it. The staged launch command lives in a sibling
-# directory namespaced by home identity, not in this shared per-id root.
-# config/tmp-root (or FM_TMP_ROOT) relocates this root and the launch directory
-# off /tmp; SPAWN_TMP_ROOT is resolved once after fm-path-lib.sh loads.
-if [ "$SPAWN_TMP_ROOT" != /tmp ] && ! (umask 077 && mkdir -p "$SPAWN_TMP_ROOT"); then
-  echo "error: cannot create the task temp root $SPAWN_TMP_ROOT from config/tmp-root" >&2
-  exit 1
-fi
-TASK_TMP="$SPAWN_TMP_ROOT/fm-$ID"
-if ! (umask 077 && mkdir "$TASK_TMP") 2>/dev/null; then
-  if [ -L "$TASK_TMP" ] || [ ! -d "$TASK_TMP" ] || [ ! -O "$TASK_TMP" ] ||
-    [ -n "$(find "$TASK_TMP" -prune \( -perm -g=w -o -perm -o=w \) -print 2>/dev/null)" ] ||
-    ! chmod 700 "$TASK_TMP"; then
-    echo "error: task temp root $TASK_TMP already exists and is not a private directory owned by this user; refusing to stage the launch command there; inspect and remove it, then retry" >&2
+# Per-task temp for ship/scout tasks lives in the task managed scratch run
+# (<run>/tmp, created by spawn_managed_run through the shared scratch-run
+# resolver), with Go build temp nested at gotmp/. fm-teardown removes only
+# "$TASK_TMP", so run.json, logs, and artifacts survive for scratch-gc.
+# A secondmate runs in its own home and keeps the legacy relocated root.
+if [ "$KIND" != secondmate ]; then
+  spawn_managed_run || exit 1
+else
+  if [ "$SPAWN_TMP_ROOT" != /tmp ] && ! (umask 077 && mkdir -p "$SPAWN_TMP_ROOT"); then
+    echo "error: cannot create the task temp root $SPAWN_TMP_ROOT from config/tmp-root" >&2
     exit 1
   fi
+  TASK_TMP="$SPAWN_TMP_ROOT/fm-$ID"
+  if ! (umask 077 && mkdir "$TASK_TMP") 2>/dev/null; then
+    if [ -L "$TASK_TMP" ] || [ ! -d "$TASK_TMP" ] || [ ! -O "$TASK_TMP" ] ||
+      [ -n "$(find "$TASK_TMP" -prune \( -perm -g=w -o -perm -o=w \) -print 2>/dev/null)" ] ||
+      ! chmod 700 "$TASK_TMP"; then
+      echo "error: task temp root $TASK_TMP already exists and is not a private directory owned by this user; refusing to stage the launch command there; inspect and remove it, then retry" >&2
+      exit 1
+    fi
+  fi
+  mkdir -p "$TASK_TMP/gotmp"
+  [ "$SPAWN_TMP_ROOT" = /tmp ] || mkdir -p "$TASK_TMP/tmp"
 fi
-mkdir -p "$TASK_TMP/gotmp"
-# A relocated root also carries the worker's general temp directory, exported as
-# TMPDIR/TMP/TEMP before launch, so mktemp and every tool that honors those land
-# under the configured root instead of the host default.
-[ "$SPAWN_TMP_ROOT" = /tmp ] || mkdir -p "$TASK_TMP/tmp"
 
 # Per-harness turn-end hook where enabled: a file that touches
 # state/<id>.turn-ended when the agent finishes a turn. Worktree-resident hooks
@@ -5830,12 +5873,18 @@ spawn_record_traceparent() {
   return "$status"
 }
 
-# Export GOTMPDIR into the crewmate's pane shell so the agent and every child
-# process (go build, go test, ...) inherit it. Sent before the launch command so
+# Export GOTMPDIR into the crewmate pane shell so the agent and every child
+# process (go build, go test, ...) inherit it. Ship/scout temp is the managed
+# run tmp itself, so TMPDIR/TMP/TEMP point at it unconditionally; a secondmate
+# keeps the legacy relocated tmp subdir. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
-[ "$SPAWN_TMP_ROOT" = /tmp ] ||
+if [ "$KIND" != secondmate ]; then
+  spawn_send_text_line "$T" "export SCRATCH_RUN_DIR=$SCRATCH_RUN_DIR SCRATCH_WORK_DIR=$SCRATCH_RUN_DIR/work SCRATCH_LOG_DIR=$SCRATCH_RUN_DIR/logs SCRATCH_ARTIFACTS_DIR=$SCRATCH_RUN_DIR/artifacts"
+  spawn_send_text_line "$T" "export TMPDIR=$TASK_TMP TMP=$TASK_TMP TEMP=$TASK_TMP"
+elif [ "$SPAWN_TMP_ROOT" != /tmp ]; then
   spawn_send_text_line "$T" "export TMPDIR=$TASK_TMP/tmp TMP=$TASK_TMP/tmp TEMP=$TASK_TMP/tmp"
+fi
 # Export the compact-adviser kill switch into the pane shell through the same
 # pre-launch channel, so later commands in that shell inherit it too. The launch
 # command independently establishes the value for the agent process itself.
